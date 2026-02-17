@@ -8,20 +8,37 @@ from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
-# Libera acesso do site
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://leticiaxs.github.io",  # seu GitHub Pages
-    ],
+    allow_origins=["https://leticiaxs.github.io"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+from fastapi import Request
+from fastapi.responses import Response
+
+ALLOWED_ORIGINS = {"https://leticiaxs.github.io"}
+
+@app.middleware("http")
+async def force_cors(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = Response(status_code=204)
+    else:
+        response = await call_next(request)
+
+    origin = request.headers.get("origin")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
 @app.get("/version")
 def version():
-    return {"version": "cors-1"}
+    return {"version": "cors-2"}    
 
 @app.get("/health")
 def health():
