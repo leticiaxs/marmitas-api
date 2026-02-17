@@ -11,7 +11,10 @@ app = FastAPI()
 # Libera acesso do site
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://leticiaxs.github.io",  # seu GitHub Pages
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
