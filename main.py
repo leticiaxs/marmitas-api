@@ -6,11 +6,7 @@ from pydantic import BaseModel
 import gspread
 from google.oauth2.service_account import Credentials
 
-
-
 app = FastAPI()
-
-@app.get("/version") def version(): return {"version": "cors-1"}
 
 # Libera acesso do site
 app.add_middleware(
@@ -22,6 +18,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/version")
+def version():
+    return {"version": "cors-1"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 API_KEY = os.environ.get("API_KEY", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
