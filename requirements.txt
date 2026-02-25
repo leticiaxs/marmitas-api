@@ -2,3 +2,5 @@ fastapi
 uvicorn
 gspread
 google-auth
+python-jose
+passlib[bcrypt]
