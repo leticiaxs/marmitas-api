@@ -2,12 +2,16 @@
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+
+from jose import jwt, JWTError
+from passlib.context import CryptContext
 
 import gspread
 from gspread.exceptions import WorksheetNotFound
@@ -38,9 +42,18 @@ app.add_middleware(
 # -----------------------------
 # ENV / Config
 # -----------------------------
+# (mantém para /api/pedido)
 API_KEY = os.environ.get("API_KEY", "")
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")
 
+# JWT (admin)
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+JWT_ALG = os.environ.get("JWT_ALG", "HS256")
+JWT_EXPIRE_MIN = int(os.environ.get("JWT_EXPIRE_MIN", "480"))  # 8h
+
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS_HASH = os.environ.get("ADMIN_PASS_HASH", "")
+
+# Google Sheets
 SHEET_ID = os.environ.get("SHEET_ID", "")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 
@@ -55,6 +68,8 @@ SCOPES = [
 ]
 
 # Cabeçalhos esperados (cria aba se não existir)
+# Observação: mantemos a coluna "categoria" na planilha por compatibilidade,
+# mas a API não usa/não expõe mais.
 HEADERS = {
     WORKSHEET_MARMITAS: ["id", "nome", "categoria", "ativo", "ordem"],
     WORKSHEET_CARDAPIO_SEMANA: ["semana_id", "titulo", "ativa", "criado_em"],
@@ -64,6 +79,45 @@ HEADERS = {
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# -----------------------------
+# Auth (JWT Admin)
+# -----------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer = HTTPBearer(auto_error=False)
+
+def _require_jwt_env():
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET não configurado no ambiente")
+    if not ADMIN_PASS_HASH:
+        raise HTTPException(status_code=500, detail="ADMIN_PASS_HASH não configurado no ambiente")
+
+def authenticate_user(username: str, password: str) -> bool:
+    _require_jwt_env()
+    if username != ADMIN_USER:
+        return False
+    return pwd_context.verify(password, ADMIN_PASS_HASH)
+
+def create_access_token(subject: str) -> str:
+    _require_jwt_env()
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=JWT_EXPIRE_MIN)
+    payload = {"sub": subject, "iat": int(now.timestamp()), "exp": exp}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
+    _require_jwt_env()
+    if not creds or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Token ausente")
+
+    token = creds.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Token inválido")
+        return sub
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
 # -----------------------------
 # Helpers (Sheets/Auth/Validation)
@@ -73,7 +127,6 @@ def _require_env():
         raise HTTPException(status_code=500, detail="SHEET_ID não configurado no ambiente")
     if not GOOGLE_CREDS_JSON:
         raise HTTPException(status_code=500, detail="GOOGLE_CREDS_JSON não configurado no ambiente")
-
 
 def _get_client() -> gspread.Client:
     _require_env()
@@ -85,14 +138,12 @@ def _get_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
-
 def _open_spreadsheet():
     gc = _get_client()
     try:
         return gc.open_by_key(SHEET_ID)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falha ao abrir planilha (SHEET_ID): {e}")
-
 
 def _ensure_worksheet(ws_name: str):
     """Garante que a aba exista e tenha cabeçalho."""
@@ -101,72 +152,54 @@ def _ensure_worksheet(ws_name: str):
         ws = sh.worksheet(ws_name)
     except WorksheetNotFound:
         ws = sh.add_worksheet(title=ws_name, rows=1000, cols=20)
-        # escreve cabeçalho se conhecido
         headers = HEADERS.get(ws_name)
         if headers:
             ws.append_row(headers, value_input_option="USER_ENTERED")
         return ws
 
-    # se existe, verifica se tem cabeçalho (linha 1)
     headers_expected = HEADERS.get(ws_name)
     if headers_expected:
         try:
             first_row = ws.row_values(1)
-            # se vazio, grava
             if not first_row:
                 ws.append_row(headers_expected, value_input_option="USER_ENTERED")
         except Exception:
-            # se não conseguir ler, segue (não quebra)
             pass
 
     return ws
 
-
 def get_sheet(ws_name: str):
     return _ensure_worksheet(ws_name)
-
-
-def require_admin(request: Request):
-    """Valida ADMIN_KEY via header x-admin-key."""
-    if not ADMIN_KEY:
-        # Se você quiser forçar sempre, troque para: raise HTTPException(500, ...)
-        raise HTTPException(status_code=500, detail="ADMIN_KEY não configurada no ambiente")
-    key = request.headers.get("x-admin-key")
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=401, detail="ADMIN_KEY inválida")
-
 
 def require_api_key(x_api_key: Optional[str]):
     """Valida API_KEY via header X-API-KEY (opcional se API_KEY estiver vazia)."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="API_KEY inválida")
 
-
 def parse_bool(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("true", "1", "sim", "yes", "y")
 
-
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 # -----------------------------
 # Models
 # -----------------------------
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
 class MarmitaIn(BaseModel):
     id: Optional[int] = None
     nome: str
-    categoria: str = ""
     ativo: bool = True
     ordem: int = 9999
-
 
 class CardapioSemanaIn(BaseModel):
     semana_id: str = Field(..., description="YYYY-MM-DD")
     titulo: str = "Cardápio da Semana"
     marmita_ids: List[int] = Field(default_factory=list)
-
 
 class PedidoIn(BaseModel):
     semana_id: str
@@ -175,7 +208,6 @@ class PedidoIn(BaseModel):
     obs: str = ""
     quantidades: Dict[str, int] = Field(default_factory=dict)
 
-
 # -----------------------------
 # Health / Version
 # -----------------------------
@@ -183,19 +215,25 @@ class PedidoIn(BaseModel):
 def version():
     return {"version": "marmitas-1.0.0"}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# -----------------------------
+# Auth - Login (JWT)
+# -----------------------------
+@app.post("/api/login")
+def login(data: LoginIn):
+    if not authenticate_user(data.username, data.password):
+        raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
+    token = create_access_token(subject=data.username)
+    return {"access_token": token, "token_type": "bearer"}
 
 # -----------------------------
-# Admin - Marmitas
+# Admin - Marmitas (JWT)
 # -----------------------------
 @app.get("/api/admin/marmitas")
-def listar_marmitas_admin(request: Request):
-    require_admin(request)
-
+def listar_marmitas_admin(user: str = Depends(require_auth)):
     ws = get_sheet(WORKSHEET_MARMITAS)
     rows = ws.get_all_records()
 
@@ -205,24 +243,22 @@ def listar_marmitas_admin(request: Request):
             mid = int(r.get("id") or 0)
         except:
             continue
+        if not mid:
+            continue
         itens.append(
             {
                 "id": mid,
                 "nome": str(r.get("nome") or "").strip(),
-                "categoria": str(r.get("categoria") or "").strip(),
                 "ativo": parse_bool(r.get("ativo", "")),
                 "ordem": int(r.get("ordem") or 9999),
             }
         )
 
-    itens.sort(key=lambda x: (x["ativo"] is False, x["ordem"], x["categoria"], x["nome"]))
+    itens.sort(key=lambda x: (x["ativo"] is False, x["ordem"], x["nome"]))
     return {"ok": True, "itens": itens}
 
-
 @app.post("/api/admin/marmita")
-def upsert_marmita(m: MarmitaIn, request: Request):
-    require_admin(request)
-
+def upsert_marmita(m: MarmitaIn, user: str = Depends(require_auth)):
     nome = (m.nome or "").strip()
     if not nome:
         raise HTTPException(status_code=400, detail="nome é obrigatório")
@@ -252,7 +288,8 @@ def upsert_marmita(m: MarmitaIn, request: Request):
         except:
             pass
 
-    values = [m_id, nome, (m.categoria or "").strip(), bool(m.ativo), int(m.ordem)]
+    # Mantém 5 colunas por compatibilidade (categoria = "")
+    values = [m_id, nome, "", bool(m.ativo), int(m.ordem)]
 
     if found_row:
         ws.update(f"A{found_row}:E{found_row}", [values])
@@ -261,33 +298,26 @@ def upsert_marmita(m: MarmitaIn, request: Request):
 
     return {"ok": True, "id": m_id}
 
-
 @app.delete("/api/admin/marmita/{m_id}")
-def desativar_marmita(m_id: int, request: Request):
-    require_admin(request)
-
+def desativar_marmita(m_id: int, user: str = Depends(require_auth)):
     ws = get_sheet(WORKSHEET_MARMITAS)
     rows = ws.get_all_records()
 
     for i, r in enumerate(rows, start=2):
         try:
             if int(r.get("id") or 0) == int(m_id):
-                # coluna D = ativo
-                ws.update(f"D{i}", "FALSE")
+                ws.update(f"D{i}", "FALSE")  # coluna D = ativo
                 return {"ok": True}
         except:
             pass
 
     raise HTTPException(status_code=404, detail="Marmita não encontrada")
 
-
 # -----------------------------
-# Admin - Cardápio da Semana
+# Admin - Cardápio da Semana (JWT)
 # -----------------------------
 @app.post("/api/admin/cardapio-semana")
-def salvar_cardapio_semana(payload: CardapioSemanaIn, request: Request):
-    require_admin(request)
-
+def salvar_cardapio_semana(payload: CardapioSemanaIn, user: str = Depends(require_auth)):
     semana_id = (payload.semana_id or "").strip()
     if not DATE_RE.match(semana_id):
         raise HTTPException(status_code=400, detail="semana_id inválido. Use YYYY-MM-DD")
@@ -353,7 +383,6 @@ def salvar_cardapio_semana(payload: CardapioSemanaIn, request: Request):
     link_cliente = f"https://leticiaxs.github.io/marmitas-site/pedido.html?semana={semana_id}"
     return {"ok": True, "semana_id": semana_id, "link_cliente": link_cliente}
 
-
 # -----------------------------
 # Público - Cardápio (Cliente)
 # -----------------------------
@@ -405,12 +434,11 @@ def obter_cardapio(semana_id: str):
         marm_map[mid] = {
             "id": mid,
             "nome": str(r.get("nome") or "").strip(),
-            "categoria": str(r.get("categoria") or "").strip(),
             "ordem": int(r.get("ordem") or 9999),
         }
 
     itens = [marm_map[mid] for mid in ids if mid in marm_map]
-    itens.sort(key=lambda x: (x["ordem"], x["categoria"], x["nome"]))
+    itens.sort(key=lambda x: (x["ordem"], x["nome"]))
 
     return {
         "ok": True,
@@ -418,7 +446,6 @@ def obter_cardapio(semana_id: str):
         "titulo": str(semana.get("titulo") or "Cardápio da Semana"),
         "itens": itens,
     }
-
 
 # -----------------------------
 # Público - Pedido (Cliente)
@@ -454,7 +481,6 @@ def criar_pedido(p: PedidoIn, x_api_key: Optional[str] = Header(default=None)):
 
     for item_name, q in (p.quantidades or {}).items():
         if item_name not in allowed_names:
-            # item não pertence ao cardápio -> rejeita
             raise HTTPException(status_code=400, detail=f"Item inválido no pedido: {item_name}")
         try:
             q = int(q or 0)
