@@ -3,4 +3,5 @@ uvicorn
 gspread
 google-auth
 python-jose
-passlib[bcrypt]
+passlib[argon2]==1.7.4
+argon2-cffi>=23.1.0
