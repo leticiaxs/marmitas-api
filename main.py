@@ -95,6 +95,15 @@ def authenticate_user(username: str, password: str) -> bool:
     _require_jwt_env()
     if username != ADMIN_USER:
         return False
+
+    pw_bytes = len(password.encode("utf-8"))
+
+    # evita o 500 do bcrypt e transforma em "login inválido"
+    if pw_bytes > 72:
+        # Log seguro (não imprime a senha!)
+        print(f"[AUTH] senha acima do limite: {pw_bytes} bytes")
+        return False
+
     return pwd_context.verify(password, ADMIN_PASS_HASH)
 
 def create_access_token(subject: str) -> str:
