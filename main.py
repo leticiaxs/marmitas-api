@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any
 
-from fastapi import FastAPI, Header, HTTPException, Request, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -80,10 +80,18 @@ HEADERS = {
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # -----------------------------
-# Auth (JWT Admin)
+# Auth (JWT Admin) - OPÇÃO A (somente Argon2)
 # -----------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Requisitos (requirements.txt):
+#   passlib[argon2]==1.7.4
+#   argon2-cffi>=23.1.0
+pwd_context = CryptContext(
+    schemes=["argon2"],
+    deprecated="auto",
+)
+
 bearer = HTTPBearer(auto_error=False)
+
 
 def _require_jwt_env():
     if not JWT_SECRET:
@@ -91,20 +99,24 @@ def _require_jwt_env():
     if not ADMIN_PASS_HASH:
         raise HTTPException(status_code=500, detail="ADMIN_PASS_HASH não configurado no ambiente")
 
+
 def authenticate_user(username: str, password: str) -> bool:
-    _require_jwt_env()
+    """
+    Autentica somente com Argon2.
+
+    Observação:
+    - Não há limite de 72 bytes como no bcrypt, então não precisa do "truncate/guard".
+    - ADMIN_PASS_HASH precisa ser um hash Argon2 válido (gerado pelo passlib).
+    """
     if username != ADMIN_USER:
         return False
 
-    pw_bytes = len(password.encode("utf-8"))
-
-    # evita o 500 do bcrypt e transforma em "login inválido"
-    if pw_bytes > 72:
-        # Log seguro (não imprime a senha!)
-        print(f"[AUTH] senha acima do limite: {pw_bytes} bytes")
+    try:
+        return pwd_context.verify(password, ADMIN_PASS_HASH)
+    except Exception:
+        # evita 500 em caso de hash inválido/configuração errada
         return False
 
-    return pwd_context.verify(password, ADMIN_PASS_HASH)
 
 def create_access_token(subject: str) -> str:
     _require_jwt_env()
@@ -112,6 +124,7 @@ def create_access_token(subject: str) -> str:
     exp = now + timedelta(minutes=JWT_EXPIRE_MIN)
     payload = {"sub": subject, "iat": int(now.timestamp()), "exp": exp}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
 
 def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
     _require_jwt_env()
@@ -128,6 +141,7 @@ def require_auth(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
+
 # -----------------------------
 # Helpers (Sheets/Auth/Validation)
 # -----------------------------
@@ -136,6 +150,7 @@ def _require_env():
         raise HTTPException(status_code=500, detail="SHEET_ID não configurado no ambiente")
     if not GOOGLE_CREDS_JSON:
         raise HTTPException(status_code=500, detail="GOOGLE_CREDS_JSON não configurado no ambiente")
+
 
 def _get_client() -> gspread.Client:
     _require_env()
@@ -147,12 +162,14 @@ def _get_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
+
 def _open_spreadsheet():
     gc = _get_client()
     try:
         return gc.open_by_key(SHEET_ID)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falha ao abrir planilha (SHEET_ID): {e}")
+
 
 def _ensure_worksheet(ws_name: str):
     """Garante que a aba exista e tenha cabeçalho."""
@@ -177,20 +194,25 @@ def _ensure_worksheet(ws_name: str):
 
     return ws
 
+
 def get_sheet(ws_name: str):
     return _ensure_worksheet(ws_name)
+
 
 def require_api_key(x_api_key: Optional[str]):
     """Valida API_KEY via header X-API-KEY (opcional se API_KEY estiver vazia)."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="API_KEY inválida")
 
+
 def parse_bool(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("true", "1", "sim", "yes", "y")
 
+
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 # -----------------------------
 # Models
@@ -199,16 +221,19 @@ class LoginIn(BaseModel):
     username: str
     password: str
 
+
 class MarmitaIn(BaseModel):
     id: Optional[int] = None
     nome: str
     ativo: bool = True
     ordem: int = 9999
 
+
 class CardapioSemanaIn(BaseModel):
     semana_id: str = Field(..., description="YYYY-MM-DD")
     titulo: str = "Cardápio da Semana"
     marmita_ids: List[int] = Field(default_factory=list)
+
 
 class PedidoIn(BaseModel):
     semana_id: str
@@ -217,6 +242,7 @@ class PedidoIn(BaseModel):
     obs: str = ""
     quantidades: Dict[str, int] = Field(default_factory=dict)
 
+
 # -----------------------------
 # Health / Version
 # -----------------------------
@@ -224,9 +250,11 @@ class PedidoIn(BaseModel):
 def version():
     return {"version": "marmitas-1.0.0"}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 # -----------------------------
 # Auth - Login (JWT)
@@ -237,6 +265,7 @@ def login(data: LoginIn):
         raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
     token = create_access_token(subject=data.username)
     return {"access_token": token, "token_type": "bearer"}
+
 
 # -----------------------------
 # Admin - Marmitas (JWT)
@@ -250,7 +279,7 @@ def listar_marmitas_admin(user: str = Depends(require_auth)):
     for r in rows:
         try:
             mid = int(r.get("id") or 0)
-        except:
+        except Exception:
             continue
         if not mid:
             continue
@@ -265,6 +294,7 @@ def listar_marmitas_admin(user: str = Depends(require_auth)):
 
     itens.sort(key=lambda x: (x["ativo"] is False, x["ordem"], x["nome"]))
     return {"ok": True, "itens": itens}
+
 
 @app.post("/api/admin/marmita")
 def upsert_marmita(m: MarmitaIn, user: str = Depends(require_auth)):
@@ -281,7 +311,7 @@ def upsert_marmita(m: MarmitaIn, user: str = Depends(require_auth)):
         for r in rows:
             try:
                 max_id = max(max_id, int(r.get("id") or 0))
-            except:
+            except Exception:
                 pass
         m_id = max_id + 1
     else:
@@ -294,7 +324,7 @@ def upsert_marmita(m: MarmitaIn, user: str = Depends(require_auth)):
             if int(r.get("id") or 0) == m_id:
                 found_row = i
                 break
-        except:
+        except Exception:
             pass
 
     # Mantém 5 colunas por compatibilidade (categoria = "")
@@ -307,6 +337,7 @@ def upsert_marmita(m: MarmitaIn, user: str = Depends(require_auth)):
 
     return {"ok": True, "id": m_id}
 
+
 @app.delete("/api/admin/marmita/{m_id}")
 def desativar_marmita(m_id: int, user: str = Depends(require_auth)):
     ws = get_sheet(WORKSHEET_MARMITAS)
@@ -317,10 +348,11 @@ def desativar_marmita(m_id: int, user: str = Depends(require_auth)):
             if int(r.get("id") or 0) == int(m_id):
                 ws.update(f"D{i}", "FALSE")  # coluna D = ativo
                 return {"ok": True}
-        except:
+        except Exception:
             pass
 
     raise HTTPException(status_code=404, detail="Marmita não encontrada")
+
 
 # -----------------------------
 # Admin - Cardápio da Semana (JWT)
@@ -349,7 +381,7 @@ def salvar_cardapio_semana(payload: CardapioSemanaIn, user: str = Depends(requir
             mid = int(r.get("id") or 0)
             if mid and parse_bool(r.get("ativo", "")):
                 marm_ativas.add(mid)
-        except:
+        except Exception:
             pass
 
     invalid = [mid for mid in marmita_ids if mid not in marm_ativas]
@@ -392,6 +424,7 @@ def salvar_cardapio_semana(payload: CardapioSemanaIn, user: str = Depends(requir
     link_cliente = f"https://leticiaxs.github.io/marmitas-site/pedido.html?semana={semana_id}"
     return {"ok": True, "semana_id": semana_id, "link_cliente": link_cliente}
 
+
 # -----------------------------
 # Público - Cardápio (Cliente)
 # -----------------------------
@@ -417,7 +450,7 @@ def obter_cardapio(semana_id: str):
         if str(r.get("semana_id") or "").strip() == semana_id:
             try:
                 ids.append(int(r.get("marmita_id") or 0))
-            except:
+            except Exception:
                 pass
 
     if not ids:
@@ -434,7 +467,7 @@ def obter_cardapio(semana_id: str):
     for r in marm_rows:
         try:
             mid = int(r.get("id") or 0)
-        except:
+        except Exception:
             continue
         if not mid:
             continue
@@ -455,6 +488,7 @@ def obter_cardapio(semana_id: str):
         "titulo": str(semana.get("titulo") or "Cardápio da Semana"),
         "itens": itens,
     }
+
 
 # -----------------------------
 # Público - Pedido (Cliente)
@@ -493,7 +527,7 @@ def criar_pedido(p: PedidoIn, x_api_key: Optional[str] = Header(default=None)):
             raise HTTPException(status_code=400, detail=f"Item inválido no pedido: {item_name}")
         try:
             q = int(q or 0)
-        except:
+        except Exception:
             raise HTTPException(status_code=400, detail=f"Quantidade inválida para: {item_name}")
         if q < 0:
             raise HTTPException(status_code=400, detail=f"Quantidade negativa para: {item_name}")
